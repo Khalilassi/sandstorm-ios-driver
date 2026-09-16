@@ -31,6 +31,7 @@ Application Under Test
 | 4 | Python SDK (`IOSDevice` / `IOSApplication` / `IOSPage` / `Locator`) | ✅ verified |
 | 5 | PySide6 Inspector (screenshot, tree, highlight, locator ranking) | ✅ implemented, logic unit-tested |
 | 6 | Waits, gestures, alerts, reconnect/supervision | ✅ implemented |
+| 7 | Test recorder (Inspector actions → runnable pytest/script) | ✅ verified: recorded, generated, replayed green |
 
 Milestone 1 output on this machine:
 
@@ -217,7 +218,40 @@ sandstorm ios inspector --port <port> --token <token>
 * full accessibility hierarchy;
 * click the screenshot → the smallest matching visible element is selected in the tree;
 * attribute table and ranked locator suggestions with one-click copy;
-* interactive Tap / Type / Long Press / Swipe.
+* interactive Tap / Type / Clear / Long Press / Swipe / Wait For;
+* **test recorder** — turn a manual walkthrough into a runnable test.
+
+### Recording a test case
+
+Press **● Record** in the Recorder panel, then drive the app. Every action is
+appended as a step and rendered as Python in the *Code* tab:
+
+| Button | Recorded step |
+|--------|---------------|
+| Launch | `app.launch(relaunch=True)` |
+| Tap / Long Press | `page.get_by_id("login_button").tap()` |
+| Type / Clear | `page.get_by_id("username").fill("khalil")` |
+| Swipe Up | `page.swipe((0.500, 0.750), (0.500, 0.250))` |
+| Wait For | `page.get_by_text("Welcome").wait_for(state="visible", timeout=10.0)` |
+| Assert Visible / Assert Text | `assert page.get_by_text("Welcome").is_visible()` |
+| Screenshot step | `page.screenshot("home.png")` |
+
+Then **Copy code** or **Save as…** to write a file you can run directly:
+
+```bash
+sandstorm ios start --udid <UDID> --token <token>
+SANDSTORM_TOKEN=<token> pytest test_login_works.py
+```
+
+Notes:
+
+* actions are recorded through the **top-ranked locator** shown in the panel,
+  and the Inspector executes that same locator — what you replay is what ran;
+* coordinates are used only when the tap did not hit a selectable element;
+* choose `pytest` (fixture + `test_` function) or `script` (`main()` with
+  `try/finally`) in the style box;
+* **Fresh** relaunches the app so a replay starts from the recorded state;
+* `Undo` drops the last step, and closing the window offers to save.
 
 ## Documentation
 
@@ -230,7 +264,7 @@ sandstorm ios inspector --port <port> --token <token>
 ## Tests
 
 ```bash
-python3 -m pytest          # protocol + inspector logic, no device needed
+python3 -m pytest          # protocol, inspector logic and recorder, no device needed
 ```
 
 ## License

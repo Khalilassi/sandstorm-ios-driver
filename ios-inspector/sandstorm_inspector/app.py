@@ -14,13 +14,15 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any, Mapping
 
 from sandstorm_ios import IOSDevice
 from sandstorm_ios.errors import IOSError
 
 from .hierarchy import Rect, describe, find_by_path, hit_test, node_title
-from .locators import recommend
+from .locators import LocatorSuggestion, best_locator, recommend
+from .recorder import Recorder, describe_target, function_name
 
 try:
     from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
@@ -29,6 +31,7 @@ try:
         QApplication,
         QCheckBox,
         QComboBox,
+        QFileDialog,
         QFormLayout,
         QGraphicsPixmapItem,
         QGraphicsRectItem,
@@ -39,12 +42,14 @@ try:
         QInputDialog,
         QLabel,
         QLineEdit,
+        QListWidget,
         QMainWindow,
         QMessageBox,
         QPlainTextEdit,
         QPushButton,
         QSplitter,
         QStatusBar,
+        QTabWidget,
         QTreeWidget,
         QTreeWidgetItem,
         QVBoxLayout,
@@ -129,11 +134,14 @@ class InspectorWindow(QMainWindow):
         self.resize(1360, 900)
 
         self._device = IOSDevice(host=host, port=port, token=token)
+        self._host = host
+        self._port = port
         self._snapshot: Mapping[str, Any] | None = None
         self._selected: Mapping[str, Any] | None = None
         self._point_size = (1.0, 1.0)
         self._default_bundle_id = bundle_id
         self._include_invisible = False
+        self._recorder = Recorder()
 
         self._build_ui()
         QTimer.singleShot(0, self._connect)
@@ -151,6 +159,12 @@ class InspectorWindow(QMainWindow):
 
         launch_button = QPushButton("Launch")
         launch_button.clicked.connect(self._launch_app)
+        self._relaunch_toggle = QCheckBox("Fresh")
+        self._relaunch_toggle.setToolTip(
+            "Terminate a running instance first, so a recorded test replays "
+            "from the same state it was recorded in."
+        )
+        self._relaunch_toggle.setChecked(True)
         refresh_button = QPushButton("Refresh")
         refresh_button.clicked.connect(self.refresh)
 
@@ -170,6 +184,7 @@ class InspectorWindow(QMainWindow):
         toolbar_layout.addWidget(QLabel("App:"))
         toolbar_layout.addWidget(self._bundle_input, 1)
         toolbar_layout.addWidget(launch_button)
+        toolbar_layout.addWidget(self._relaunch_toggle)
         toolbar_layout.addWidget(refresh_button)
         toolbar_layout.addWidget(self._invisible_toggle)
         toolbar_layout.addWidget(self._auto_refresh)
@@ -207,15 +222,20 @@ class InspectorWindow(QMainWindow):
         detail_splitter = QSplitter(Qt.Orientation.Horizontal)
         detail_splitter.addWidget(details)
         detail_splitter.addWidget(locators)
-        detail_splitter.setSizes([680, 680])
+        detail_splitter.addWidget(self._build_recorder_panel())
+        detail_splitter.setSizes([420, 460, 480])
 
         actions = QWidget()
         actions_layout = QHBoxLayout(actions)
         for title, handler in (
             ("Tap", self._action_tap),
             ("Type", self._action_type),
+            ("Clear", self._action_clear),
             ("Long Press", self._action_long_press),
             ("Swipe Up", self._action_swipe),
+            ("Wait For", self._action_wait_for),
+            ("Assert Visible", self._action_assert_visible),
+            ("Assert Text", self._action_assert_text),
             ("Refresh", self.refresh),
         ):
             button = QPushButton(title)
@@ -236,6 +256,121 @@ class InspectorWindow(QMainWindow):
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh)
+        self._update_code_preview()
+    # -- Recorder panel ------------------------------------------------------
+
+    def _build_recorder_panel(self) -> QWidget:
+        panel = QGroupBox("Recorder")
+        layout = QVBoxLayout(panel)
+
+        controls = QHBoxLayout()
+        self._record_button = QPushButton("● Record")
+        self._record_button.setCheckable(True)
+        self._record_button.setToolTip(
+            "While recording, every action below is appended as a test step."
+        )
+        self._record_button.toggled.connect(self._toggle_recording)
+
+        self._case_name = QLineEdit("recorded flow")
+        self._case_name.setPlaceholderText("Test case name")
+        self._case_name.textChanged.connect(lambda _: self._update_code_preview())
+
+        self._style_box = QComboBox()
+        self._style_box.addItems(["pytest", "script"])
+        self._style_box.currentIndexChanged.connect(lambda _: self._update_code_preview())
+
+        controls.addWidget(self._record_button)
+        controls.addWidget(self._case_name, 1)
+        controls.addWidget(self._style_box)
+
+        self._step_list = QListWidget()
+        self._step_list.setMinimumHeight(110)
+
+        self._code_preview = QPlainTextEdit()
+        self._code_preview.setReadOnly(True)
+        self._code_preview.setMinimumHeight(110)
+
+        buttons = QHBoxLayout()
+        for title, handler in (
+            ("Undo", self._recorder_undo),
+            ("Clear", self._recorder_clear),
+            ("Screenshot step", self._action_record_screenshot),
+            ("Copy code", self._copy_code),
+            ("Save as\u2026", self._save_code),
+        ):
+            button = QPushButton(title)
+            button.clicked.connect(handler)
+            buttons.addWidget(button)
+
+        tabs = QTabWidget()
+        tabs.addTab(self._step_list, "Steps")
+        tabs.addTab(self._code_preview, "Code")
+        self._recorder_tabs = tabs
+
+        layout.addLayout(controls)
+        layout.addWidget(tabs, 1)
+        layout.addLayout(buttons)
+        return panel
+
+    def _toggle_recording(self, active: bool) -> None:
+        if active:
+            self._recorder.start()
+            self._record_button.setText("■ Stop")
+            self._record_button.setStyleSheet("color: #c0392b; font-weight: bold;")
+            bundle = self._bundle_input.text().strip()
+            self.statusBar().showMessage(f"Recording {bundle or 'session'}\u2026")
+        else:
+            self._recorder.stop()
+            self._record_button.setText("● Record")
+            self._record_button.setStyleSheet("")
+            self.statusBar().showMessage(f"Recording stopped, {len(self._recorder)} step(s)", 4000)
+        self._update_code_preview()
+
+    def _on_step_recorded(self, step) -> None:
+        if step is None:
+            return
+        self._step_list.addItem(step.summary)
+        self._step_list.scrollToBottom()
+        self._update_code_preview()
+
+    def _recorder_undo(self) -> None:
+        if self._recorder.undo() is None:
+            return
+        self._step_list.takeItem(self._step_list.count() - 1)
+        self._update_code_preview()
+
+    def _recorder_clear(self) -> None:
+        if len(self._recorder) and QMessageBox.question(
+            self, "Clear recording", f"Discard {len(self._recorder)} recorded step(s)?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._recorder.clear()
+        self._step_list.clear()
+        self._update_code_preview()
+
+    def _generated_code(self) -> str:
+        return self._recorder.generate(
+            bundle_id=self._bundle_input.text().strip() or self._default_bundle_id,
+            name=self._case_name.text().strip() or "recorded flow",
+            style=self._style_box.currentText(),
+            host=self._host,
+            port=self._port,
+        )
+
+    def _update_code_preview(self) -> None:
+        self._code_preview.setPlainText(self._generated_code())
+
+    def _copy_code(self) -> None:
+        QGuiApplication.clipboard().setText(self._generated_code())
+        self.statusBar().showMessage("Test code copied to the clipboard", 3000)
+
+    def _save_code(self) -> None:
+        suggested = f"{function_name(self._case_name.text().strip() or 'recorded flow')}.py"
+        path, _ = QFileDialog.getSaveFileName(self, "Save test case", suggested, "Python (*.py)")
+        if not path:
+            return
+        Path(path).write_text(self._generated_code(), encoding="utf-8")
+        self.statusBar().showMessage(f"Saved {path}", 5000)
 
     # -- Session -------------------------------------------------------------
 
@@ -260,7 +395,11 @@ class InspectorWindow(QMainWindow):
         bundle = self._bundle_input.text().strip()
         if not bundle:
             return
-        self._run(lambda: self._device.app(bundle).launch(), f"Launched {bundle}")
+        relaunch = self._relaunch_toggle.isChecked()
+        if self._run(
+            lambda: self._device.app(bundle).launch(relaunch=relaunch), f"Launched {bundle}"
+        ):
+            self._on_step_recorded(self._recorder.record_launch(bundle, relaunch=relaunch))
         self.refresh()
 
     def refresh(self) -> None:
@@ -383,39 +522,163 @@ class InspectorWindow(QMainWindow):
             return None
         return ((rect.x + rect.width / 2) / width, (rect.y + rect.height / 2) / height)
 
+    def _selected_suggestion(self) -> LocatorSuggestion | None:
+        """Best locator for the selection, or ``None`` when nothing is selected.
+
+        The Inspector executes and records this very suggestion, so a recorded
+        script reproduces exactly what was clicked.
+        """
+        if self._selected is None or self._snapshot is None:
+            return None
+        return best_locator(self._selected, self._snapshot)
+
+    def _require_locator(self) -> tuple[Any, LocatorSuggestion] | None:
+        suggestion = self._selected_suggestion()
+        if suggestion is None:
+            self.statusBar().showMessage("Select an element first", 4000)
+            return None
+        return suggestion.build(self._page), suggestion
+
+    @property
+    def _target_name(self) -> str:
+        return describe_target(self._selected)
+
     def _action_tap(self) -> None:
+        suggestion = self._selected_suggestion()
+        if suggestion is not None:
+            locator = suggestion.build(self._page)
+            if self._run(locator.tap, f"Tapped {self._target_name}"):
+                self._on_step_recorded(
+                    self._recorder.record_tap(suggestion.inline_code, self._target_name)
+                )
+            self.refresh()
+            return
         point = self._normalized_center()
         if point is None:
+            self.statusBar().showMessage("Select an element first", 4000)
             return
-        self._run(lambda: self._page.tap(*point), "Tapped")
+        if self._run(lambda: self._page.tap(*point), "Tapped"):
+            self._on_step_recorded(self._recorder.record_tap(None, "point", point))
         self.refresh()
 
     def _action_long_press(self) -> None:
+        suggestion = self._selected_suggestion()
+        if suggestion is not None:
+            locator = suggestion.build(self._page)
+            if self._run(locator.long_press, f"Long pressed {self._target_name}"):
+                self._on_step_recorded(
+                    self._recorder.record_long_press(suggestion.inline_code, self._target_name)
+                )
+            self.refresh()
+            return
         point = self._normalized_center()
         if point is None:
+            self.statusBar().showMessage("Select an element first", 4000)
             return
-        self._run(lambda: self._page.long_press(*point), "Long pressed")
+        if self._run(lambda: self._page.long_press(*point), "Long pressed"):
+            self._on_step_recorded(self._recorder.record_long_press(None, "point", point))
         self.refresh()
 
     def _action_type(self) -> None:
-        if self._selected is None:
+        resolved = self._require_locator()
+        if resolved is None:
             return
+        locator, suggestion = resolved
         text, accepted = QInputDialog.getText(self, "Type text", "Text to type:")
         if not accepted or not text:
             return
-        identifier = self._selected.get("identifier")
-        page = self._page
-        locator = (
-            page.get_by_id(identifier)
-            if identifier
-            else page.get_by_label(self._selected.get("label") or "")
-        )
-        self._run(lambda: locator.fill(text), "Typed")
+        if self._run(lambda: locator.fill(text), f"Typed into {self._target_name}"):
+            self._on_step_recorded(
+                self._recorder.record_fill(suggestion.inline_code, self._target_name, text)
+            )
+        self.refresh()
+
+    def _action_clear(self) -> None:
+        resolved = self._require_locator()
+        if resolved is None:
+            return
+        locator, suggestion = resolved
+        if self._run(locator.clear, f"Cleared {self._target_name}"):
+            self._on_step_recorded(
+                self._recorder.record_clear(suggestion.inline_code, self._target_name)
+            )
         self.refresh()
 
     def _action_swipe(self) -> None:
-        self._run(lambda: self._page.swipe((0.5, 0.75), (0.5, 0.25)), "Swiped")
+        start, end = (0.5, 0.75), (0.5, 0.25)
+        if self._run(lambda: self._page.swipe(start, end), "Swiped"):
+            self._on_step_recorded(self._recorder.record_swipe(start, end))
         self.refresh()
+
+    def _action_wait_for(self) -> None:
+        resolved = self._require_locator()
+        if resolved is None:
+            return
+        locator, suggestion = resolved
+        states = ["visible", "exists", "enabled", "not_visible", "not_exists"]
+        state, accepted = QInputDialog.getItem(self, "Wait for", "State:", states, 0, False)
+        if not accepted:
+            return
+        if self._run(
+            lambda: locator.wait_for(state=state, timeout=10.0),
+            f"{self._target_name} is {state}",
+        ):
+            self._on_step_recorded(
+                self._recorder.record_wait_for(suggestion.inline_code, self._target_name, state)
+            )
+
+    def _action_assert_visible(self) -> None:
+        resolved = self._require_locator()
+        if resolved is None:
+            return
+        locator, suggestion = resolved
+        try:
+            visible = locator.is_visible()
+        except IOSError as exc:
+            self.statusBar().showMessage(str(exc), 5000)
+            return
+        self.statusBar().showMessage(
+            f"{self._target_name} is {'visible' if visible else 'NOT visible'}", 4000
+        )
+        if visible:
+            self._on_step_recorded(
+                self._recorder.record_assert_visible(suggestion.inline_code, self._target_name)
+            )
+
+    def _action_assert_text(self) -> None:
+        resolved = self._require_locator()
+        if resolved is None:
+            return
+        locator, suggestion = resolved
+        try:
+            current = locator.text_content()
+        except IOSError as exc:
+            self.statusBar().showMessage(str(exc), 5000)
+            return
+        text, accepted = QInputDialog.getText(
+            self, "Assert text", "Expected text:", text=current
+        )
+        if not accepted:
+            return
+        self._on_step_recorded(
+            self._recorder.record_assert_text(suggestion.inline_code, self._target_name, text)
+        )
+        if text != current:
+            self.statusBar().showMessage(
+                f"Recorded, but the element currently reads {current!r}", 6000
+            )
+
+    def _action_record_screenshot(self) -> None:
+        name, accepted = QInputDialog.getText(
+            self, "Screenshot step", "File name:", text="screen.png"
+        )
+        if not accepted or not name:
+            return
+        step = self._recorder.record_screenshot(name)
+        if step is None:
+            self.statusBar().showMessage("Start recording first", 4000)
+            return
+        self._on_step_recorded(step)
 
     def _copy_locator(self) -> None:
         if self._selected is None or self._snapshot is None:
@@ -426,14 +689,31 @@ class InspectorWindow(QMainWindow):
         QGuiApplication.clipboard().setText(suggestions[0].code)
         self.statusBar().showMessage("Locator copied", 2000)
 
-    def _run(self, action, success_message: str) -> None:
+    def _run(self, action, success_message: str) -> bool:
+        """Runs an agent call, reports it, and returns whether it succeeded."""
         try:
             action()
-            self.statusBar().showMessage(success_message, 2000)
         except IOSError as exc:
             self.statusBar().showMessage(str(exc), 5000)
+            return False
+        self.statusBar().showMessage(success_message, 2000)
+        return True
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if len(self._recorder):
+            choice = QMessageBox.question(
+                self,
+                "Unsaved recording",
+                f"{len(self._recorder)} recorded step(s) have not been saved. Save now?",
+                QMessageBox.StandardButton.Save
+                | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+            )
+            if choice == QMessageBox.StandardButton.Cancel:
+                event.ignore()
+                return
+            if choice == QMessageBox.StandardButton.Save:
+                self._save_code()
         self._refresh_timer.stop()
         self._device.disconnect()
         super().closeEvent(event)

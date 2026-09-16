@@ -54,6 +54,25 @@ sandstorm ios setup --udid <SIM_UDID>
 python3 examples/smoke_simulator.py <SIM_UDID>     # opens Simulator.app; SANDSTORM_HEADLESS=1 to hide
 ```
 
+## Recording a test case
+
+```bash
+sandstorm ios inspector --port <port> --token dev1 --bundle-id <BUNDLE_ID>
+```
+
+1. **Launch** the app (keep **Fresh** ticked so replays start from the same state).
+2. Press **● Record**.
+3. Click elements on the screenshot and drive the app with Tap / Type / Swipe /
+   Wait For / Assert. Each action is appended as a step.
+4. **Save as…** writes a runnable file; replay it with:
+
+```bash
+SANDSTORM_AGENT_PORT=<port> SANDSTORM_TOKEN=dev1 pytest test_login_works.py
+```
+
+The generated file reads `SANDSTORM_AGENT_HOST`, `SANDSTORM_AGENT_PORT` and
+`SANDSTORM_TOKEN`, so the same test runs against any machine or device.
+
 ## Troubleshooting
 
 | Message | Fix |

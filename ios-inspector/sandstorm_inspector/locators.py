@@ -6,7 +6,7 @@ scoring can be reused by a future code generator or linter.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 MAX_SCORE = 5
@@ -21,10 +21,26 @@ class LocatorSuggestion:
     unique: bool
     code: str
     reason: str
+    criteria: Mapping[str, Any] = field(default_factory=dict)
+    index: int | None = None
 
     @property
     def stars(self) -> str:
         return f"{self.score}/{MAX_SCORE}"
+
+    @property
+    def inline_code(self) -> str:
+        """``code`` collapsed onto a single line, ready to be chained."""
+        return inline(self.code)
+
+    def build(self, page: Any) -> Any:
+        """Materializes this suggestion as a real SDK ``Locator``.
+
+        Keeping construction here guarantees the Inspector executes exactly the
+        locator it displays and records.
+        """
+        locator = page.locator(**dict(self.criteria))
+        return locator if self.index is None else locator.nth(self.index)
 
 
 def iter_nodes(node: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
@@ -44,6 +60,12 @@ def _count_matches(root: Mapping[str, Any], **criteria: Any) -> int:
 
 def _escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def inline(code: str) -> str:
+    """Collapses a multi-line locator expression onto one line."""
+    joined = " ".join(part.strip() for part in code.splitlines() if part.strip())
+    return joined.replace("( ", "(").replace(" )", ")").replace(", )", ")")
 
 
 def recommend(
@@ -79,6 +101,7 @@ def recommend(
                 reason="Accessibility identifiers are set by developers and survive copy changes"
                 if unique
                 else "Identifier is not unique in this hierarchy",
+                criteria={"identifier": identifier},
             )
         )
         if not unique:
@@ -94,6 +117,7 @@ def recommend(
                         f')'
                     ),
                     reason="Narrows a duplicated identifier by element type",
+                    criteria={"type": element_type, "identifier": identifier},
                 )
             )
 
@@ -108,6 +132,7 @@ def recommend(
                 reason="Readable, but breaks under localization"
                 if unique
                 else "Several elements share this label",
+                criteria={"label": label},
             )
         )
         if element_type:
@@ -124,6 +149,7 @@ def recommend(
                         f')'
                     ),
                     reason="Compound match evaluated in a single NSPredicate",
+                    criteria={"type": element_type, "label": label},
                 )
             )
 
@@ -135,6 +161,7 @@ def recommend(
                 unique=_count_matches(root, value=value) == 1,
                 code=f'page.get_by_text("{_escape(value)}")',
                 reason="Matches label, value, title or placeholder",
+                criteria={"text": value},
             )
         )
 
@@ -152,6 +179,7 @@ def recommend(
                 unique=True,
                 code=f"page.get_by_predicate('{predicate}')",
                 reason="Full NSPredicate power, evaluated inside the app process",
+                criteria={"predicate": predicate},
             )
         )
 
@@ -164,6 +192,8 @@ def recommend(
                 unique=True,
                 code=f'page.get_by_type("{element_type}").nth({index})',
                 reason="Positional; breaks whenever the layout changes. Use as a last resort",
+                criteria={"type": element_type},
+                index=index,
             )
         )
 
