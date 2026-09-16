@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sandstorm-ios"
+version = "0.1.0"
+description = "Sandstorm iOS Driver — a lightweight XCTest-native alternative to Appium for iOS UI automation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Sandstorm" }]
+keywords = ["ios", "xctest", "xcuitest", "automation", "testing", "appium-alternative"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+inspector = ["PySide6>=6.6"]
+device = ["pymobiledevice3>=4.0"]
+dev = ["pytest>=8.0", "mypy>=1.8", "ruff>=0.4"]
+
+[project.scripts]
+sandstorm = "sandstorm_controller.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["ios-sdk", "ios-controller", "ios-inspector"]
+include = ["sandstorm_ios*", "sandstorm_controller*", "sandstorm_inspector*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["ios-sdk", "ios-controller", "ios-inspector"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+mypy_path = "ios-sdk:ios-controller:ios-inspector"
+warn_unused_ignores = true
